@@ -19,8 +19,6 @@ blindcar/main.o: ..\Core\Src\main.c ..\Core\Inc\main.h \
   ..\Drivers\STM32F1xx_HAL_Driver\Inc\stm32f1xx_hal_flash_ex.h \
   ..\Drivers\STM32F1xx_HAL_Driver\Inc\stm32f1xx_hal_i2c.h \
   ..\Drivers\STM32F1xx_HAL_Driver\Inc\stm32f1xx_hal_pwr.h \
-  ..\Drivers\STM32F1xx_HAL_Driver\Inc\stm32f1xx_hal_uart.h \
-  ..\App\Services\system_state.h \
   ..\Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS\cmsis_os.h \
   ..\Middlewares\Third_Party\FreeRTOS\Source\include\FreeRTOS.h \
   ..\Core\Inc\FreeRTOSConfig.h \
@@ -35,5 +33,4 @@ blindcar/main.o: ..\Core\Src\main.c ..\Core\Inc\main.h \
   ..\Middlewares\Third_Party\FreeRTOS\Source\include\queue.h \
   ..\Middlewares\Third_Party\FreeRTOS\Source\include\semphr.h \
   ..\Middlewares\Third_Party\FreeRTOS\Source\include\event_groups.h \
-  ..\Modules\LCD\lcd_display.h ..\Modules\Sensor\sensor_filter.h \
-  ..\App\Config\system_config.h ..\App\Config\thresholds.h
+  ..\Modules\LCD\lcd_display.h

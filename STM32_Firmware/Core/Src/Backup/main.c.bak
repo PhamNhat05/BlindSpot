@@ -4,18 +4,26 @@
   * @file           : main.c
   * @brief          : Main program body
   ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "cmsis_os.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
-#include <stdlib.h>
 
 #include "FreeRTOS.h"
 #include "event_groups.h"
@@ -32,10 +40,9 @@
 typedef struct
 {
   uint32_t timestamp_ms;
-  uint16_t distance_mm;
+  uint16_t distance_cm; // Chuy?n sang d�ng s? nguy�n uint16_t
   uint8_t is_object_detected;
   system_status_t system_status;
-  warning_level_t warning_level;
 } distance_data_t;
 
 typedef struct
@@ -59,13 +66,19 @@ typedef struct
 
 typedef struct
 {
-  volatile uint32_t echo_start_ticks;
-  volatile uint32_t echo_pulse_ticks;
+  volatile uint32_t echo_start_us;
+  volatile uint32_t echo_pulse_us;
   volatile uint8_t waiting_fall_edge;
   volatile uint8_t echo_ready;
   volatile uint8_t measurement_active;
 } sensor_capture_t;
 
+typedef struct
+{
+  uint16_t filtered_cm; // Chuy?n sang s? nguy�n
+  uint8_t has_value;
+  uint8_t spike_count;  // Th�m bi?n d?m s? l?n d?t bi?n d? ch?t gi� tr? nhanh (Snap)
+} sensor_filter_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -77,46 +90,41 @@ typedef struct
 #define SENSOR_TRIGGER_PULSE_US        10U
 #define SENSOR_STARTUP_DELAY_MS       500U
 
-/* Ngưỡng khoảng cách chính xác (milimet) */
-#define SENSOR_BLIND_SPOT_MM          200U   /* Dưới 20cm là điểm mù nhiễu sóng */
-#define WARNING_DISTANCE_THRESHOLD_MM 500U   /* 20cm - 50cm: DANGER */
-#define SAFE_DISTANCE_THRESHOLD_MM    1500U  /* 50cm - 150cm: WARNING. Trên 150cm: SAFE */
-#define SENSOR_MAX_VALID_MM           6000U
+#define SENSOR_MIN_VALID_CM            20U // C?p nh?t sang s? nguy�n
+#define SENSOR_MAX_VALID_CM           600U
+#define SENSOR_FILTER_MAX_STEP_CM      50U
 
-/* THUẬT TOÁN CHỐNG NHIỄU VÙNG MÙ */
-#define DANGER_HOLD_TIME_MS           800U   /* Giữ trạng thái DANGER 0.8s để lấp đi các nhịp nhảy rác */
-#define MAX_RETREAT_STEP_MM           300U   /* Vận tốc lùi tối đa: 30cm/100ms. Cao hơn sẽ bị coi là nhiễu màng loa */
+#define SAFE_DISTANCE_THRESHOLD_CM    100U
+#define WARNING_DISTANCE_THRESHOLD_CM  50U
 
-/* Cảnh báo nhấp nháy */
 #define ALERT_REFRESH_PERIOD_MS        50U
-#define ALERT_TIMEOUT_BLINK_MS        100U   
-#define ALERT_WARNING_BLINK_MS        300U   
-#define ALERT_ERROR_BLINK_MS          150U   
+#define ALERT_WARNING_BLINK_MS        500U
+#define ALERT_WARNING_BEEP_WINDOW_MS  120U
+#define ALERT_WARNING_BEEP_PERIOD_MS  700U
+#define ALERT_ERROR_BLINK_MS          200U
 
-/* Hàng đợi và Tác vụ */
 #define SENSOR_QUEUE_LENGTH             4U
 #define DISPLAY_QUEUE_LENGTH            1U
+
 #define SENSOR_TASK_STACK_SIZE        256U
 #define WARNING_TASK_STACK_SIZE       256U
 #define DISPLAY_TASK_STACK_SIZE       256U
+
 #define SENSOR_TASK_PRIORITY            4U
 #define WARNING_TASK_PRIORITY           5U
 #define DISPLAY_TASK_PRIORITY           2U
 
-/* Sự kiện */
 #define EVENT_SENSOR_DATA          (1UL << 0)
 #define EVENT_ALERT_TICK           (1UL << 1)
-
-/* Nút nhấn và LED */
-#define MUTE_BUTTON_PIN            GPIO_PIN_10
-#define MUTE_BUTTON_PORT           GPIOA
-#define MUTE_LED_PIN               GPIO_PIN_11
-#define MUTE_LED_PORT              GPIOA
 /* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
-osThreadId defaultTaskHandle;
 
 /* USER CODE BEGIN PV */
 static const sensor_pin_t sensor_pins[SENSOR_COUNT] = {
@@ -127,32 +135,23 @@ static const sensor_pin_t sensor_pins[SENSOR_COUNT] = {
 static QueueHandle_t sensorQueue;
 static QueueHandle_t displayQueue;
 static SemaphoreHandle_t echoSem[SENSOR_COUNT];
+static SemaphoreHandle_t sampleSem;
 static SemaphoreHandle_t lcdMutex;
 static EventGroupHandle_t appEvents;
 static TimerHandle_t sampleTimer;
 static TimerHandle_t alertTimer;
 
 static sensor_capture_t sensorCapture[SENSOR_COUNT];
+static sensor_filter_t sensorFilter[SENSOR_COUNT];
 static system_state_t sensorState[SENSOR_COUNT];
-
-/* Bộ nhớ theo dõi vật thể (RADAR TRACKER) */
-static uint32_t danger_lock_time[SENSOR_COUNT] = {0, 0};
-static uint16_t last_valid_mm[SENSOR_COUNT] = {2000U, 2000U};
-
+static system_state_t combinedState;
 static uint32_t cpuTicksPerUs;
-static TaskHandle_t sensorTaskHandle;
-
-/* Biến điều khiển tắt còi bằng nút nhấn */
-static volatile bool mute_request = false;   
-static bool mute_enabled = false;           
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
-void StartDefaultTask(void const * argument);
-
 /* USER CODE BEGIN PFP */
 static void Main_CreateRtosObjects(void);
 static void Main_CreateTasks(void);
@@ -169,34 +168,75 @@ static void AlertTimerCallback(TimerHandle_t timer);
 static void HandleEchoEdgeFromIsr(uint16_t gpio_pin);
 /* USER CODE END PFP */
 
+/* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
 /* USER CODE END 0 */
 
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
   SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_I2C1_Init();
-  
   /* USER CODE BEGIN 2 */
   Board_InitApplication();
   Main_CreateRtosObjects();
   Main_CreateTasks();
   /* USER CODE END 2 */
 
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 128);
-  defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
+  /* Start scheduler */
+  vTaskStartScheduler();
 
-  osKernelStart();
-  while (1) {}
+  /* We should never get here as control is now taken by the scheduler */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
 }
 
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -206,6 +246,8 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
@@ -219,8 +261,21 @@ void SystemClock_Config(void)
   }
 }
 
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_I2C1_Init(void)
 {
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
   hi2c1.Init.ClockSpeed = 100000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
@@ -234,36 +289,55 @@ static void MX_I2C1_Init(void)
   {
     Error_Handler();
   }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
 }
 
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
 
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_AFIO_CLK_ENABLE(); 
 
-  HAL_GPIO_WritePin(GPIOA, trig_Pin|trig2_Pin|MUTE_LED_PIN, GPIO_PIN_RESET);
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1|GPIO_PIN_3, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4|led_Pin|buzz_Pin, GPIO_PIN_RESET);
 
-  GPIO_InitStruct.Pin = trig_Pin|trig2_Pin|MUTE_LED_PIN;
+  /*Configure GPIO pins : PA1 PA3 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_3;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : Echo_Pin echo2_Pin */
   GPIO_InitStruct.Pin = Echo_Pin|echo2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : PB4 led_Pin buzz_Pin */
   GPIO_InitStruct.Pin = GPIO_PIN_4|led_Pin|buzz_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
   GPIO_InitStruct.Pin = Echo_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
@@ -276,110 +350,168 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(echo2_GPIO_Port, &GPIO_InitStruct);
 
-  GPIO_InitStruct.Pin = MUTE_BUTTON_PIN;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(MUTE_BUTTON_PORT, &GPIO_InitStruct);
-
   HAL_NVIC_SetPriority(EXTI2_IRQn, 6, 0);
   HAL_NVIC_EnableIRQ(EXTI2_IRQn);
   HAL_NVIC_SetPriority(EXTI4_IRQn, 6, 0);
   HAL_NVIC_EnableIRQ(EXTI4_IRQn);
-  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 7, 0);
-  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-void EXTI15_10_IRQHandler(void)
-{
-  HAL_GPIO_EXTI_IRQHandler(MUTE_BUTTON_PIN);
-}
-
 static void Main_Require(BaseType_t result)
 {
-  if (result != pdPASS) { Error_Handler(); }
+  if (result != pdPASS)
+  {
+    Error_Handler();
+  }
 }
 
 static void Main_RequirePtr(const void *pointer)
 {
-  if (pointer == NULL) { Error_Handler(); }
+  if (pointer == NULL)
+  {
+    Error_Handler();
+  }
 }
 
 static void Main_CreateRtosObjects(void)
 {
+  uint8_t i;
+
   sensorQueue = xQueueCreate(SENSOR_QUEUE_LENGTH, sizeof(sensor_message_t));
   displayQueue = xQueueCreate(DISPLAY_QUEUE_LENGTH, sizeof(display_message_t));
   lcdMutex = xSemaphoreCreateMutex();
+  sampleSem = xSemaphoreCreateBinary();
   appEvents = xEventGroupCreate();
 
   Main_RequirePtr(sensorQueue);
   Main_RequirePtr(displayQueue);
   Main_RequirePtr(lcdMutex);
+  Main_RequirePtr(sampleSem);
   Main_RequirePtr(appEvents);
 
-  for (uint8_t i = 0U; i < SENSOR_COUNT; i++)
+  for (i = 0U; i < SENSOR_COUNT; i++)
   {
     echoSem[i] = xSemaphoreCreateBinary();
     Main_RequirePtr(echoSem[i]);
   }
 
-  sampleTimer = xTimerCreate("sample", pdMS_TO_TICKS(SENSOR_SAMPLE_PERIOD_MS), pdTRUE, NULL, SampleTimerCallback);
-  alertTimer = xTimerCreate("alert", pdMS_TO_TICKS(ALERT_REFRESH_PERIOD_MS), pdTRUE, NULL, AlertTimerCallback);
+  sampleTimer = xTimerCreate("sample",
+                             pdMS_TO_TICKS(SENSOR_SAMPLE_PERIOD_MS),
+                             pdTRUE,
+                             NULL,
+                             SampleTimerCallback);
+  alertTimer = xTimerCreate("alert",
+                            pdMS_TO_TICKS(ALERT_REFRESH_PERIOD_MS),
+                            pdTRUE,
+                            NULL,
+                            AlertTimerCallback);
+  Main_RequirePtr(sampleTimer);
+  Main_RequirePtr(alertTimer);
   Main_Require(xTimerStart(sampleTimer, 0U));
   Main_Require(xTimerStart(alertTimer, 0U));
 }
 
 static void Main_CreateTasks(void)
 {
-  Main_Require(xTaskCreate(SensorTask, "Sensor", SENSOR_TASK_STACK_SIZE, NULL, SENSOR_TASK_PRIORITY, &sensorTaskHandle));
-  Main_Require(xTaskCreate(WarningTask, "Warning", WARNING_TASK_STACK_SIZE, NULL, WARNING_TASK_PRIORITY, NULL));
-  Main_Require(xTaskCreate(DisplayTask, "Display", DISPLAY_TASK_STACK_SIZE, NULL, DISPLAY_TASK_PRIORITY, NULL));
+  Main_Require(xTaskCreate(SensorTask,
+                           "Sensor",
+                           SENSOR_TASK_STACK_SIZE,
+                           NULL,
+                           SENSOR_TASK_PRIORITY,
+                           NULL));
+  Main_Require(xTaskCreate(WarningTask,
+                           "Warning",
+                           WARNING_TASK_STACK_SIZE,
+                           NULL,
+                           WARNING_TASK_PRIORITY,
+                           NULL));
+  Main_Require(xTaskCreate(DisplayTask,
+                           "Display",
+                           DISPLAY_TASK_STACK_SIZE,
+                           NULL,
+                           DISPLAY_TASK_PRIORITY,
+                           NULL));
 }
 
 static void DelayCounter_Init(void)
 {
   cpuTicksPerUs = HAL_RCC_GetHCLKFreq() / 1000000U;
+
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
   DWT->CYCCNT = 0U;
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 }
 
+static uint32_t GetMicroseconds(void)
+{
+  if (cpuTicksPerUs == 0U)
+  {
+    DelayCounter_Init();
+  }
+
+  return DWT->CYCCNT / cpuTicksPerUs;
+}
+
 static void DelayUs(uint32_t microseconds)
 {
-  uint32_t start_tick = DWT->CYCCNT;
-  uint32_t wait_tick = microseconds * cpuTicksPerUs;
-  while ((DWT->CYCCNT - start_tick) < wait_tick) {}
+  uint32_t start_tick;
+  uint32_t wait_tick;
+
+  if (cpuTicksPerUs == 0U)
+  {
+    DelayCounter_Init();
+  }
+
+  start_tick = DWT->CYCCNT;
+  wait_tick = microseconds * cpuTicksPerUs;
+
+  while ((DWT->CYCCNT - start_tick) < wait_tick)
+  {
+  }
 }
 
 static void Capture_Reset(uint8_t sensor_id)
 {
-  sensorCapture[sensor_id].echo_start_ticks = 0U;
-  sensorCapture[sensor_id].echo_pulse_ticks = 0U;
+  sensorCapture[sensor_id].echo_start_us = 0U;
+  sensorCapture[sensor_id].echo_pulse_us = 0U;
   sensorCapture[sensor_id].waiting_fall_edge = 0U;
   sensorCapture[sensor_id].echo_ready = 0U;
   sensorCapture[sensor_id].measurement_active = 0U;
 }
 
+static void Filter_Reset(uint8_t sensor_id)
+{
+  sensorFilter[sensor_id].filtered_cm = 0U;
+  sensorFilter[sensor_id].has_value = 0U;
+  sensorFilter[sensor_id].spike_count = 0U;
+}
+
 static void FillTimeout(distance_data_t *distance)
 {
   distance->timestamp_ms = HAL_GetTick();
-  distance->distance_mm = 0U;
+  distance->distance_cm = 0U;
   distance->is_object_detected = 0U;
   distance->system_status = SYSTEM_STATUS_SENSOR_TIMEOUT;
 }
 
 static void Sensor_StartMeasurement(uint8_t sensor_id)
 {
-  sensorCapture[sensor_id].echo_pulse_ticks = 0U;
+  sensorCapture[sensor_id].echo_pulse_us = 0U;
   sensorCapture[sensor_id].waiting_fall_edge = 0U;
   sensorCapture[sensor_id].echo_ready = 0U;
   sensorCapture[sensor_id].measurement_active = 1U;
 
-  HAL_GPIO_WritePin(sensor_pins[sensor_id].trig_port, sensor_pins[sensor_id].trig_pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(TRig_GPIO_Port, TRig_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(trig2_GPIO_Port, trig2_Pin, GPIO_PIN_RESET);
   DelayUs(2U);
-  HAL_GPIO_WritePin(sensor_pins[sensor_id].trig_port, sensor_pins[sensor_id].trig_pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(sensor_pins[sensor_id].trig_port,
+                    sensor_pins[sensor_id].trig_pin,
+                    GPIO_PIN_SET);
   DelayUs(SENSOR_TRIGGER_PULSE_US);
-  HAL_GPIO_WritePin(sensor_pins[sensor_id].trig_port, sensor_pins[sensor_id].trig_pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(sensor_pins[sensor_id].trig_port,
+                    sensor_pins[sensor_id].trig_pin,
+                    GPIO_PIN_RESET);
 }
 
 static void Sensor_StopMeasurement(uint8_t sensor_id)
@@ -394,15 +526,21 @@ static bool Sensor_Read(uint8_t sensor_id, distance_data_t *distance)
   sensor_capture_t *capture;
 
   if ((sensor_id >= SENSOR_COUNT) || (distance == NULL) || (echoSem[sensor_id] == NULL))
+  {
     return false;
+  }
 
   capture = &sensorCapture[sensor_id];
   FillTimeout(distance);
 
-  (void)xSemaphoreTake(echoSem[sensor_id], 0);
+  while (xSemaphoreTake(echoSem[sensor_id], 0U) == pdPASS)
+  {
+  }
+
   Sensor_StartMeasurement(sensor_id);
 
-  if (xSemaphoreTake(echoSem[sensor_id], pdMS_TO_TICKS(SENSOR_ECHO_TIMEOUT_MS)) != pdPASS)
+  if (xSemaphoreTake(echoSem[sensor_id],
+                     pdMS_TO_TICKS(SENSOR_ECHO_TIMEOUT_MS)) != pdPASS)
   {
     Sensor_StopMeasurement(sensor_id);
     FillTimeout(distance);
@@ -411,32 +549,124 @@ static bool Sensor_Read(uint8_t sensor_id, distance_data_t *distance)
 
   distance->timestamp_ms = HAL_GetTick();
 
-  if ((capture->echo_ready == 0U) || (capture->echo_pulse_ticks == 0U))
+  if ((capture->echo_ready == 0U) || (capture->echo_pulse_us == 0U))
   {
-    distance->distance_mm = 0U;
+    distance->distance_cm = 0U;
     distance->is_object_detected = 0U;
     distance->system_status = SYSTEM_STATUS_SENSOR_FAULT;
     Sensor_StopMeasurement(sensor_id);
     return false;
   }
 
-  {
-    uint32_t pulse_us = capture->echo_pulse_ticks / cpuTicksPerUs;
-    distance->distance_mm = (uint16_t)((pulse_us * 10U) / 58U); 
-  }
-
+  // Chuy?n d?i si�u �m b?ng s? nguy�n. 
+  // C�ng th?c: Pulse / 58 = CM. +29 d? l�m tr�n (Rounding) t?i uu nh?t.
+  distance->distance_cm = (uint16_t)((capture->echo_pulse_us + 29U) / 58U);
   distance->is_object_detected = 1U;
   distance->system_status = SYSTEM_STATUS_OK;
   Sensor_StopMeasurement(sensor_id);
   return true;
 }
 
-static warning_level_t PickWarningLevel(uint16_t distance_mm, system_status_t status)
+static void Filter_Apply(uint8_t sensor_id, distance_data_t *distance)
 {
-  if (status == SYSTEM_STATUS_SENSOR_BELOW_MIN) return WARNING_LEVEL_DANGER;
-  if (status == SYSTEM_STATUS_OK && distance_mm > 0 && distance_mm < SENSOR_BLIND_SPOT_MM) return WARNING_LEVEL_DANGER;
-  if (status == SYSTEM_STATUS_OK && distance_mm > 0 && distance_mm <= WARNING_DISTANCE_THRESHOLD_MM) return WARNING_LEVEL_DANGER;
-  if (status == SYSTEM_STATUS_OK && distance_mm > WARNING_DISTANCE_THRESHOLD_MM && distance_mm <= SAFE_DISTANCE_THRESHOLD_MM) return WARNING_LEVEL_WARNING;
+  uint16_t sample_cm;
+  sensor_filter_t *filter;
+
+  if ((sensor_id >= SENSOR_COUNT) ||
+      (distance == NULL) ||
+      (distance->system_status != SYSTEM_STATUS_OK))
+  {
+    return;
+  }
+
+  sample_cm = distance->distance_cm;
+
+  if (sample_cm < SENSOR_MIN_VALID_CM)
+  {
+    distance->distance_cm = SENSOR_MIN_VALID_CM;
+    distance->is_object_detected = 1U;
+    distance->system_status = SYSTEM_STATUS_SENSOR_BELOW_MIN;
+    return;
+  }
+
+  if (sample_cm > SENSOR_MAX_VALID_CM)
+  {
+    distance->distance_cm = 0U;
+    distance->is_object_detected = 0U;
+    distance->system_status = SYSTEM_STATUS_SENSOR_FAULT;
+    return;
+  }
+
+  filter = &sensorFilter[sensor_id];
+
+  if (filter->has_value == 0U)
+  {
+    filter->filtered_cm = sample_cm;
+    filter->has_value = 1U;
+    filter->spike_count = 0U;
+  }
+  else
+  {
+    uint16_t delta;
+    
+    // T�nh kho?ng c�ch ch�nh l?ch tuy?t d?i
+    if (sample_cm > filter->filtered_cm) {
+      delta = sample_cm - filter->filtered_cm;
+    } else {
+      delta = filter->filtered_cm - sample_cm;
+    }
+
+    if (delta > SENSOR_FILTER_MAX_STEP_CM)
+    {
+      filter->spike_count++;
+      
+      // N?u c� 2 l?n nh?y xa/g?n li�n ti?p -> V?t th? th?c s? chuy?n d?ng
+      if (filter->spike_count >= 2U) 
+      {
+        filter->filtered_cm = sample_cm; // Nh?y th?ng (Snap) d?n gi� tr? th?c
+        filter->spike_count = 0U;
+      }
+      else
+      {
+        // Tr? l?i gi� tr? cu v� nghi ng? d�y l� nhi?u gai (Spike/Noise)
+        distance->distance_cm = filter->filtered_cm; 
+        return; 
+      }
+    }
+    else
+    {
+      // N?u thay d?i ch?m th� Reset Spike v� d�ng trung b�nh l�m mu?t EMA
+      filter->spike_count = 0U;
+      filter->filtered_cm = (sample_cm + filter->filtered_cm) / 2U; 
+    }
+  }
+
+  distance->distance_cm = filter->filtered_cm;
+  distance->is_object_detected = 1U;
+  distance->system_status = SYSTEM_STATUS_OK;
+}
+
+static warning_level_t PickWarningLevel(uint16_t distance_cm, system_status_t status)
+{
+  if (status == SYSTEM_STATUS_SENSOR_BELOW_MIN)
+  {
+    return WARNING_LEVEL_DANGER;
+  }
+
+  if (status != SYSTEM_STATUS_OK)
+  {
+    return WARNING_LEVEL_SAFE;
+  }
+
+  if (distance_cm < WARNING_DISTANCE_THRESHOLD_CM)
+  {
+    return WARNING_LEVEL_DANGER;
+  }
+
+  if (distance_cm <= SAFE_DISTANCE_THRESHOLD_CM)
+  {
+    return WARNING_LEVEL_WARNING;
+  }
 
   return WARNING_LEVEL_SAFE;
 }
@@ -444,127 +674,184 @@ static warning_level_t PickWarningLevel(uint16_t distance_mm, system_status_t st
 static void MakeState(const distance_data_t *distance, system_state_t *state)
 {
   state->timestamp_ms = distance->timestamp_ms;
-  state->distance_mm = distance->distance_mm;
+  
+  // �p sang float d? tuong th�ch v?i c?u tr�c hi?n th? b�n file header
+  state->distance_cm = (float)distance->distance_cm; 
+  
   state->system_status = distance->system_status;
   state->is_object_detected = distance->is_object_detected;
 
-  if (state->system_status != SYSTEM_STATUS_OK && state->system_status != SYSTEM_STATUS_SENSOR_BELOW_MIN)
+  if ((state->system_status != SYSTEM_STATUS_OK) &&
+      (state->system_status != SYSTEM_STATUS_SENSOR_BELOW_MIN))
   {
-    state->distance_mm = 0U;
+    state->distance_cm = 0.0f;
     state->is_object_detected = 0U;
   }
 
-  state->warning_level = PickWarningLevel(state->distance_mm, state->system_status);
+  state->warning_level = PickWarningLevel(distance->distance_cm, state->system_status);
+}
+
+static uint8_t StatusPriority(system_status_t status)
+{
+  switch (status)
+  {
+    case SYSTEM_STATUS_SENSOR_BELOW_MIN:
+      return 4U;
+
+    case SYSTEM_STATUS_SENSOR_TIMEOUT:
+      return 3U;
+
+    case SYSTEM_STATUS_SENSOR_FAULT:
+      return 2U;
+
+    default:
+      return 0U;
+  }
+}
+
+static void CombineState(void)
+{
+  const system_state_t *left = &sensorState[0];
+  const system_state_t *right = &sensorState[1];
+
+  combinedState.timestamp_ms =
+      (left->timestamp_ms > right->timestamp_ms) ? left->timestamp_ms : right->timestamp_ms;
+  combinedState.system_status =
+      (StatusPriority(left->system_status) >= StatusPriority(right->system_status))
+          ? left->system_status
+          : right->system_status;
+
+  if ((left->warning_level == WARNING_LEVEL_DANGER) ||
+      (right->warning_level == WARNING_LEVEL_DANGER))
+  {
+    combinedState.warning_level = WARNING_LEVEL_DANGER;
+  }
+  else if ((left->warning_level == WARNING_LEVEL_WARNING) ||
+           (right->warning_level == WARNING_LEVEL_WARNING))
+  {
+    combinedState.warning_level = WARNING_LEVEL_WARNING;
+  }
+  else
+  {
+    combinedState.warning_level = WARNING_LEVEL_SAFE;
+  }
+
+  combinedState.is_object_detected =
+      (uint8_t)((left->is_object_detected != 0U) ||
+                (right->is_object_detected != 0U));
+
+  if ((left->system_status == SYSTEM_STATUS_OK) &&
+      (right->system_status == SYSTEM_STATUS_OK))
+  {
+    combinedState.distance_cm =
+        (left->distance_cm < right->distance_cm) ? left->distance_cm : right->distance_cm;
+  }
+  else if (left->system_status == SYSTEM_STATUS_OK)
+  {
+    combinedState.distance_cm = left->distance_cm;
+  }
+  else if (right->system_status == SYSTEM_STATUS_OK)
+  {
+    combinedState.distance_cm = right->distance_cm;
+  }
+  else
+  {
+    combinedState.distance_cm = 0.0f;
+  }
 }
 
 static void InitDefaultState(void)
 {
   distance_data_t timeout_distance;
+  uint8_t i;
+
   FillTimeout(&timeout_distance);
 
-  for (uint8_t i = 0U; i < SENSOR_COUNT; i++) {
+  for (i = 0U; i < SENSOR_COUNT; i++)
+  {
     MakeState(&timeout_distance, &sensorState[i]);
   }
+
+  CombineState();
 }
 
 static void PublishDisplay(void)
 {
   display_message_t message;
+
   message.sensor[0] = sensorState[0];
   message.sensor[1] = sensorState[1];
   (void)xQueueOverwrite(displayQueue, &message);
 }
 
-/* THUẬT TOÁN THEO DÕI VẬT LÝ - CHỐNG NHIỄU CHE MÀNG LOA */
 static void ProcessSensorMessage(const sensor_message_t *message)
 {
   distance_data_t distance;
-  uint32_t now = HAL_GetTick();
 
-  if ((message == NULL) || (message->sensor_id >= SENSOR_COUNT)) return;
+  if ((message == NULL) || (message->sensor_id >= SENSOR_COUNT))
+  {
+    return;
+  }
 
-  uint8_t id = message->sensor_id;
   distance = message->distance;
-  uint16_t raw = distance.distance_mm;
-  bool is_erratic = false;
 
-  // 1. Phân loại tín hiệu lỗi vật lý
-  if (distance.system_status != SYSTEM_STATUS_OK || raw > SENSOR_MAX_VALID_MM) {
-      is_erratic = true;
-  } else {
-      // 2. Lọc vận tốc lùi phi lý: Đang ở trong tầm ngắm mà khoảng cách bỗng TĂNG vọt cực nhanh
-      int32_t step = (int32_t)raw - (int32_t)last_valid_mm[id];
-      if (last_valid_mm[id] <= WARNING_DISTANCE_THRESHOLD_MM && step > (int32_t)MAX_RETREAT_STEP_MM) {
-          // Bắt quả tang sóng dội ảo! Đánh dấu tín hiệu này là rác (Erratic)
-          is_erratic = true; 
-      } else {
-          last_valid_mm[id] = raw; // Tín hiệu di chuyển mượt mà, lưu lại
-      }
+  if (distance.system_status == SYSTEM_STATUS_OK)
+  {
+    Filter_Apply(message->sensor_id, &distance);
   }
 
-  // 3. Quản lý thời gian khóa: Chỉ cần vật thể lọt vào tầm 50cm, nạp năng lượng khóa 0.8 giây
-  if (!is_erratic && last_valid_mm[id] > 0 && last_valid_mm[id] <= WARNING_DISTANCE_THRESHOLD_MM) {
-      danger_lock_time[id] = now + DANGER_HOLD_TIME_MS;
-  }
-
-  // 4. Quyết định xuất tín hiệu ra màn hình và còi
-  if (is_erratic) {
-      if (now < danger_lock_time[id]) {
-          // Bỗng dưng mất tín hiệu hoặc nhảy loạn ngay lúc có vật ở gần -> Tay đang che sát cảm biến!
-          // KHÓA CỨNG Ở CHẾ ĐỘ NGUY HIỂM
-          distance.distance_mm = 199U;  // Ép hiển thị <20cm
-          distance.system_status = SYSTEM_STATUS_SENSOR_BELOW_MIN;
-          distance.is_object_detected = 1U;
-      } else {
-          // Mất tín hiệu khi ngoài trời quang đãng -> Mất kết nối thật sự
-          distance.distance_mm = 0U;
-          distance.system_status = SYSTEM_STATUS_SENSOR_TIMEOUT;
-          distance.is_object_detected = 0U;
-          last_valid_mm[id] = 2000U; // Trả về khoảng cách an toàn ảo
-      }
-  } else {
-      // Tín hiệu sạch sẽ, xuất ra bình thường
-      distance.distance_mm = last_valid_mm[id];
-      if (distance.distance_mm < SENSOR_BLIND_SPOT_MM) {
-          distance.system_status = SYSTEM_STATUS_SENSOR_BELOW_MIN;
-      } else {
-          distance.system_status = SYSTEM_STATUS_OK;
-      }
-  }
-
-  MakeState(&distance, &sensorState[id]);
+  MakeState(&distance, &sensorState[message->sensor_id]);
+  CombineState();
 }
 
-/* LOGIC CHO LED CẢNH BÁO TỪNG SENSOR (PB4, PB5) */
 static uint8_t LedShouldBeOn(const system_state_t *state, uint32_t tick_ms)
 {
-  if (state->system_status == SYSTEM_STATUS_SENSOR_TIMEOUT || state->system_status == SYSTEM_STATUS_SENSOR_FAULT)
-    return (uint8_t)(((tick_ms / ALERT_TIMEOUT_BLINK_MS) % 2U) != 0U);
-
-  if (state->warning_level == WARNING_LEVEL_DANGER || state->system_status == SYSTEM_STATUS_SENSOR_BELOW_MIN)
+  if (state->system_status == SYSTEM_STATUS_SENSOR_BELOW_MIN)
+  {
     return 1U;
+  }
 
-  if (state->warning_level == WARNING_LEVEL_WARNING)
-    return (uint8_t)(((tick_ms / ALERT_WARNING_BLINK_MS) % 2U) != 0U);
-
-  return 0U;
-}
-
-/* LOGIC CHO CÒI: CHỈ KÊU KHI CÓ DANGER HOẶC MẤT KẾT NỐI */
-static uint8_t BuzzerShouldBeOn(uint32_t tick_ms)
-{
-  const system_state_t *s1 = &sensorState[0];
-  const system_state_t *s2 = &sensorState[1];
-
-  if (s1->system_status == SYSTEM_STATUS_SENSOR_TIMEOUT || s2->system_status == SYSTEM_STATUS_SENSOR_TIMEOUT)
+  if (state->system_status != SYSTEM_STATUS_OK)
   {
     return (uint8_t)(((tick_ms / ALERT_ERROR_BLINK_MS) % 2U) != 0U);
   }
 
-  if (s1->warning_level == WARNING_LEVEL_DANGER || s2->warning_level == WARNING_LEVEL_DANGER ||
-      s1->system_status == SYSTEM_STATUS_SENSOR_BELOW_MIN || s2->system_status == SYSTEM_STATUS_SENSOR_BELOW_MIN)
+  if (state->warning_level == WARNING_LEVEL_DANGER)
   {
     return 1U;
+  }
+
+  if (state->warning_level == WARNING_LEVEL_WARNING)
+  {
+    return (uint8_t)(((tick_ms / ALERT_WARNING_BLINK_MS) % 2U) != 0U);
+  }
+
+  return 0U;
+}
+
+static uint8_t BuzzerShouldBeOn(const system_state_t *state, uint32_t tick_ms)
+{
+  uint32_t pattern_tick;
+
+  if (state->system_status == SYSTEM_STATUS_SENSOR_BELOW_MIN)
+  {
+    return 1U;
+  }
+
+  if (state->system_status != SYSTEM_STATUS_OK)
+  {
+    return (uint8_t)(((tick_ms / ALERT_ERROR_BLINK_MS) % 2U) != 0U);
+  }
+
+  if (state->warning_level == WARNING_LEVEL_DANGER)
+  {
+    return 1U;
+  }
+
+  if (state->warning_level == WARNING_LEVEL_WARNING)
+  {
+    pattern_tick = tick_ms % ALERT_WARNING_BEEP_PERIOD_MS;
+    return (uint8_t)(pattern_tick < ALERT_WARNING_BEEP_WINDOW_MS);
   }
 
   return 0U;
@@ -574,29 +861,27 @@ static void UpdateWarningOutputs(void)
 {
   uint32_t tick_ms = HAL_GetTick();
 
-  HAL_GPIO_WritePin(led_GPIO_Port, led_Pin,
+  HAL_GPIO_WritePin(led_GPIO_Port,
+                    led_Pin,
                     LedShouldBeOn(&sensorState[0], tick_ms) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(led2_GPIO_Port, led2_Pin,
+  HAL_GPIO_WritePin(led2_GPIO_Port,
+                    led2_Pin,
                     LedShouldBeOn(&sensorState[1], tick_ms) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-
-  if (mute_enabled)
-  {
-    HAL_GPIO_WritePin(buzz_GPIO_Port, buzz_Pin, GPIO_PIN_RESET);
-  }
-  else
-  {
-    HAL_GPIO_WritePin(buzz_GPIO_Port, buzz_Pin,
-                      BuzzerShouldBeOn(tick_ms) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-  }
+  HAL_GPIO_WritePin(buzz_GPIO_Port,
+                    buzz_Pin,
+                    BuzzerShouldBeOn(&combinedState, tick_ms) ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
 static void Board_InitApplication(void)
 {
+  uint8_t i;
+
   DelayCounter_Init();
 
-  for (uint8_t i = 0U; i < SENSOR_COUNT; i++)
+  for (i = 0U; i < SENSOR_COUNT; i++)
   {
     Capture_Reset(i);
+    Filter_Reset(i);
   }
 
   InitDefaultState();
@@ -606,9 +891,6 @@ static void Board_InitApplication(void)
   HAL_GPIO_WritePin(buzz_GPIO_Port, buzz_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(TRig_GPIO_Port, TRig_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(trig2_GPIO_Port, trig2_Pin, GPIO_PIN_RESET);
-  
-  HAL_GPIO_WritePin(MUTE_LED_PORT, MUTE_LED_PIN, GPIO_PIN_RESET);
-
   (void)lcd_display_init();
 }
 
@@ -622,7 +904,7 @@ static void SensorTask(void *argument)
 
   for (;;)
   {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    (void)xSemaphoreTake(sampleSem, portMAX_DELAY);
 
     for (sensor_id = 0U; sensor_id < SENSOR_COUNT; sensor_id++)
     {
@@ -646,8 +928,6 @@ static void WarningTask(void *argument)
 {
   EventBits_t events;
   sensor_message_t message;
-  TickType_t last_mute_time = 0;
-  const TickType_t debounce_ticks = pdMS_TO_TICKS(250); 
 
   (void)argument;
   InitDefaultState();
@@ -668,22 +948,8 @@ static void WarningTask(void *argument)
       {
         ProcessSensorMessage(&message);
       }
-      PublishDisplay();
-    }
 
-    if (mute_request)
-    {
-      TickType_t now = xTaskGetTickCount();
-      if ((now - last_mute_time) > debounce_ticks)
-      {
-        mute_enabled = !mute_enabled; 
-        
-        HAL_GPIO_WritePin(MUTE_LED_PORT, MUTE_LED_PIN,
-                          mute_enabled ? GPIO_PIN_SET : GPIO_PIN_RESET);
-                          
-        last_mute_time = now;
-      }
-      mute_request = false;
+      PublishDisplay();
     }
 
     UpdateWarningOutputs();
@@ -693,6 +959,7 @@ static void WarningTask(void *argument)
 static void DisplayTask(void *argument)
 {
   display_message_t message;
+
   (void)argument;
 
   for (;;)
@@ -711,7 +978,7 @@ static void DisplayTask(void *argument)
 static void SampleTimerCallback(TimerHandle_t timer)
 {
   (void)timer;
-  xTaskNotifyGive(sensorTaskHandle); 
+  (void)xSemaphoreGive(sampleSem);
 }
 
 static void AlertTimerCallback(TimerHandle_t timer)
@@ -723,30 +990,46 @@ static void AlertTimerCallback(TimerHandle_t timer)
 static void HandleEchoEdgeFromIsr(uint16_t gpio_pin)
 {
   uint8_t sensor_id;
-  uint32_t now_ticks;
+  uint32_t now_us;
   BaseType_t higher_priority_woken = pdFALSE;
   sensor_capture_t *capture;
 
-  if (gpio_pin == Echo_Pin) { sensor_id = 0U; }
-  else if (gpio_pin == echo2_Pin) { sensor_id = 1U; }
-  else { return; }
+  if (gpio_pin == Echo_Pin)
+  {
+    sensor_id = 0U;
+  }
+  else if (gpio_pin == echo2_Pin)
+  {
+    sensor_id = 1U;
+  }
+  else
+  {
+    return;
+  }
 
   capture = &sensorCapture[sensor_id];
-  if (capture->measurement_active == 0U) return;
 
-  now_ticks = DWT->CYCCNT;
+  if (capture->measurement_active == 0U)
+  {
+    return;
+  }
+
+  now_us = GetMicroseconds();
 
   if (HAL_GPIO_ReadPin(sensor_pins[sensor_id].echo_port,
                        sensor_pins[sensor_id].echo_pin) == GPIO_PIN_SET)
   {
-    capture->echo_start_ticks = now_ticks;
+    capture->echo_start_us = now_us;
     capture->waiting_fall_edge = 1U;
     return;
   }
 
-  if (capture->waiting_fall_edge == 0U) return;
+  if (capture->waiting_fall_edge == 0U)
+  {
+    return;
+  }
 
-  capture->echo_pulse_ticks = now_ticks - capture->echo_start_ticks;
+  capture->echo_pulse_us = now_us - capture->echo_start_us;
   capture->waiting_fall_edge = 0U;
   capture->echo_ready = 1U;
 
@@ -756,31 +1039,36 @@ static void HandleEchoEdgeFromIsr(uint16_t gpio_pin)
 
 void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin)
 {
-  if (gpio_pin == Echo_Pin || gpio_pin == echo2_Pin)
-  {
-    HandleEchoEdgeFromIsr(gpio_pin);
-  }
-  else if (gpio_pin == MUTE_BUTTON_PIN)
-  {
-    mute_request = true;
-  }
+  HandleEchoEdgeFromIsr(gpio_pin);
 }
 /* USER CODE END 4 */
 
-void StartDefaultTask(void const * argument)
-{
-  for(;;) { osDelay(1); }
-}
-
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
 void Error_Handler(void)
 {
+  /* USER CODE BEGIN Error_Handler_Debug */
   __disable_irq();
-  while (1) {}
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
 }
-
 #ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  * where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  (void)file; (void)line;
+  /* USER CODE BEGIN 6 */
+  (void)file;
+  (void)line;
+  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

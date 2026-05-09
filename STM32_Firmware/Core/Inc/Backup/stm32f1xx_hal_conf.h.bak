@@ -65,8 +65,6 @@
 /*#define HAL_SPI_MODULE_ENABLED   */
 /*#define HAL_SRAM_MODULE_ENABLED   */
 /*#define HAL_TIM_MODULE_ENABLED   */
-/*#define HAL_UART_MODULE_ENABLED   */
-/*#define HAL_USART_MODULE_ENABLED   */
 /*#define HAL_WWDG_MODULE_ENABLED   */
 
 #define HAL_CORTEX_MODULE_ENABLED
@@ -111,7 +109,7 @@
 
 /**
   * @brief External Low Speed oscillator (LSE) value.
-  *        This value is used by the UART, RTC HAL module to compute the system frequency
+  *        This value is used by the RTC HAL module to compute the system frequency
   */
 #if !defined  (LSE_VALUE)
   #define LSE_VALUE    32768U /*!< Value of the External oscillator in Hz*/
@@ -153,8 +151,6 @@
 #define  USE_HAL_SRAM_REGISTER_CALLBACKS        0U /* SRAM register callback disabled      */
 #define  USE_HAL_SPI_REGISTER_CALLBACKS         0U /* SPI register callback disabled       */
 #define  USE_HAL_TIM_REGISTER_CALLBACKS         0U /* TIM register callback disabled       */
-#define  USE_HAL_UART_REGISTER_CALLBACKS        0U /* UART register callback disabled      */
-#define  USE_HAL_USART_REGISTER_CALLBACKS       0U /* USART register callback disabled     */
 #define  USE_HAL_WWDG_REGISTER_CALLBACKS        0U /* WWDG register callback disabled      */
 
 /* ########################## Assert Selection ############################## */
@@ -333,14 +329,6 @@
 #ifdef HAL_TIM_MODULE_ENABLED
 #include "stm32f1xx_hal_tim.h"
 #endif /* HAL_TIM_MODULE_ENABLED */
-
-#ifdef HAL_UART_MODULE_ENABLED
-#include "stm32f1xx_hal_uart.h"
-#endif /* HAL_UART_MODULE_ENABLED */
-
-#ifdef HAL_USART_MODULE_ENABLED
-#include "stm32f1xx_hal_usart.h"
-#endif /* HAL_USART_MODULE_ENABLED */
 
 #ifdef HAL_IRDA_MODULE_ENABLED
 #include "stm32f1xx_hal_irda.h"

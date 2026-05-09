@@ -3,345 +3,268 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "system_config.h"
 #include "main.h"
 
-/* ---- Minimal CLCD I2C implementation (linker fix) ---- */
-#ifndef CLCD_I2C_MINIMAL_IMPL
-#define CLCD_I2C_MINIMAL_IMPL
+#define LCD_I2C_ADDRESS             (0x27U << 1)
+#define LCD_COLUMN_COUNT            16U
+#define LCD_ROW_COUNT                2U
+#define LCD_BOOT_DELAY_MS           50U
 
-#define CLCD_COMMAND 0x00U
-#define CLCD_DATA    0x01U
+#define LCD_ENABLE_BIT              0x04U
+#define LCD_REGISTER_SELECT_BIT     0x01U
+#define LCD_BACKLIGHT_BIT           0x08U
 
-#define LCD_EN 0x04U
-#define LCD_RW 0x02U
-#define LCD_RS 0x01U
+#define LCD_CMD_CLEAR               0x01U
+#define LCD_CMD_HOME                0x02U
+#define LCD_CMD_ENTRY_MODE          0x06U
+#define LCD_CMD_DISPLAY_ON          0x0CU
+#define LCD_CMD_FUNCTION_SET        0x28U
+#define LCD_CMD_SET_DDRAM           0x80U
 
-/* commands */
-#define LCD_CLEARDISPLAY  0x01U
-#define LCD_RETURNHOME   0x02U
+#define LCD_MODE_COMMAND            0U
+#define LCD_MODE_DATA               1U
 
-/* function set / entry mode / display control / cursor shift */
-#define LCD_ENTRYMODESET      0x04U
-#define LCD_ENTRYLEFT         0x02U
-#define LCD_ENTRYSHIFTDECREMENT 0x00U
-#define LCD_4BITMODE          0x00U
-#define LCD_2LINE             0x08U
-#define LCD_5x8DOTS           0x00U
-#define LCD_FUNCTIONSET      0x20U
-#define LCD_DISPLAYCONTROL   0x08U
-#define LCD_DISPLAYON        0x04U
-#define LCD_CURSOROFF        0x00U
-#define LCD_BLINKOFF         0x00U
-#define LCD_CURSORSHIFT      0x10U
-#define LCD_CURSORMOVE       0x00U
-#define LCD_MOVERIGHT        0x04U
-
-#define LCD_SETDDRAMADDR     0x80U
-#define LCD_SETDDRAMADDR	    0x80U
-
-#define LCD_BACKLIGHT 0x08U
-
-#define LCD_CURSORON  0x02U
-#define LCD_BLINKON   0x01U
-
-static void CLCD_Delay(uint16_t t)
+typedef struct
 {
-  HAL_Delay(t);
-}
+  I2C_HandleTypeDef *i2c;
+  uint8_t address;
+  uint8_t columns;
+  uint8_t rows;
+  uint8_t backlight;
+} lcd_i2c_t;
 
-static void CLCD_WriteI2C(CLCD_I2C_Name* LCD, uint8_t Data, uint8_t Mode)
+static lcd_i2c_t lcd;
+static uint8_t lcd_ready;
+
+static void lcd_i2c_write(uint8_t value, uint8_t mode)
 {
-  uint8_t Data_H;
-  uint8_t Data_L;
-  uint8_t Data_I2C[4];
+  uint8_t high = (uint8_t)(value & 0xF0U);
+  uint8_t low = (uint8_t)((value << 4) & 0xF0U);
+  uint8_t frame[4];
 
-  Data_H = (uint8_t)(Data & 0xF0U);
-  Data_L = (uint8_t)((Data << 4) & 0xF0U);
-
-  if (LCD->BACKLIGHT != 0U)
+  if (lcd.backlight != 0U)
   {
-    Data_H |= LCD_BACKLIGHT;
-    Data_L |= LCD_BACKLIGHT;
+    high |= LCD_BACKLIGHT_BIT;
+    low |= LCD_BACKLIGHT_BIT;
   }
 
-  if (Mode == CLCD_DATA)
+  if (mode == LCD_MODE_DATA)
   {
-    Data_H |= LCD_RS;
-    Data_L |= LCD_RS;
-  }
-  else
-  {
-    Data_H &= (uint8_t)~LCD_RS;
-    Data_L &= (uint8_t)~LCD_RS;
+    high |= LCD_REGISTER_SELECT_BIT;
+    low |= LCD_REGISTER_SELECT_BIT;
   }
 
-  Data_I2C[0] = (uint8_t)(Data_H | LCD_EN);
-  /* Giảm delay để tránh chiếm CPU quá lâu khi cập nhật LCD liên tục */
-  CLCD_Delay(0U);
-  Data_I2C[1] = Data_H;
-  Data_I2C[2] = (uint8_t)(Data_L | LCD_EN);
-  CLCD_Delay(0U);
-  Data_I2C[3] = Data_L;
+  frame[0] = (uint8_t)(high | LCD_ENABLE_BIT);
+  frame[1] = high;
+  frame[2] = (uint8_t)(low | LCD_ENABLE_BIT);
+  frame[3] = low;
 
-  (void)HAL_I2C_Master_Transmit(LCD->I2C, LCD->ADDRESS, Data_I2C, sizeof(Data_I2C), 1000U);
+  (void)HAL_I2C_Master_Transmit(lcd.i2c, lcd.address, frame, sizeof(frame), 100U);
 }
 
-void CLCD_I2C_Init(CLCD_I2C_Name* LCD,
-                    I2C_HandleTypeDef* hi2c_CLCD,
-                    uint8_t Address,
-                    uint8_t Colums,
-                    uint8_t Rows)
+static void lcd_command(uint8_t command)
 {
-  if ((LCD == 0) || (hi2c_CLCD == 0)) return;
-
-  LCD->I2C = hi2c_CLCD;
-  LCD->ADDRESS = Address;
-  LCD->COLUMS = Colums;
-  LCD->ROWS = Rows;
-
-  LCD->FUNCTIONSET = (uint8_t)(LCD_FUNCTIONSET | LCD_4BITMODE | LCD_2LINE | LCD_5x8DOTS);
-  LCD->ENTRYMODE = (uint8_t)(LCD_ENTRYMODESET | LCD_ENTRYLEFT | LCD_ENTRYSHIFTDECREMENT);
-  LCD->DISPLAYCTRL = (uint8_t)(LCD_DISPLAYCONTROL | LCD_DISPLAYON | LCD_CURSOROFF | LCD_BLINKOFF);
-  LCD->CURSORSHIFT = (uint8_t)(LCD_CURSORSHIFT | LCD_CURSORMOVE | LCD_MOVERIGHT);
-  LCD->BACKLIGHT = LCD_BACKLIGHT;
-
-  CLCD_Delay(50U);
-  CLCD_WriteI2C(LCD, 0x33U, CLCD_COMMAND);
-  CLCD_WriteI2C(LCD, 0x33U, CLCD_COMMAND);
-  CLCD_Delay(5U);
-  CLCD_WriteI2C(LCD, 0x32U, CLCD_COMMAND);
-  CLCD_Delay(5U);
-  CLCD_WriteI2C(LCD, 0x20U, CLCD_COMMAND);
-  CLCD_Delay(5U);
-
-  CLCD_WriteI2C(LCD, LCD->ENTRYMODE, CLCD_COMMAND);
-  CLCD_WriteI2C(LCD, LCD->DISPLAYCTRL, CLCD_COMMAND);
-  CLCD_WriteI2C(LCD, LCD->CURSORSHIFT, CLCD_COMMAND);
-  CLCD_WriteI2C(LCD, LCD->FUNCTIONSET, CLCD_COMMAND);
-
-  CLCD_WriteI2C(LCD, LCD_CLEARDISPLAY, CLCD_COMMAND);
-  CLCD_WriteI2C(LCD, LCD_RETURNHOME, CLCD_COMMAND);
+  lcd_i2c_write(command, LCD_MODE_COMMAND);
 }
 
-void CLCD_I2C_SetCursor(CLCD_I2C_Name* LCD, uint8_t Xpos, uint8_t Ypos)
+static void lcd_data(char data)
 {
-  uint8_t DRAM_ADDRESS = 0x00U;
-
-  if (LCD == 0) return;
-
-  if (Xpos >= LCD->COLUMS) Xpos = (uint8_t)(LCD->COLUMS - 1U);
-  if (Ypos >= LCD->ROWS)  Ypos = (uint8_t)(LCD->ROWS - 1U);
-
-  if (Ypos == 0U)       DRAM_ADDRESS = (uint8_t)(0x00U + Xpos);
-  else if (Ypos == 1U)  DRAM_ADDRESS = (uint8_t)(0x40U + Xpos);
-  else if (Ypos == 2U)  DRAM_ADDRESS = (uint8_t)(0x14U + Xpos);
-  else if (Ypos == 3U)  DRAM_ADDRESS = (uint8_t)(0x54U + Xpos);
-
-  CLCD_WriteI2C(LCD, (uint8_t)(LCD_SETDDRAMADDR | DRAM_ADDRESS), CLCD_COMMAND);
+  lcd_i2c_write((uint8_t)data, LCD_MODE_DATA);
 }
 
-void CLCD_I2C_WriteChar(CLCD_I2C_Name* LCD, char character)
+static void lcd_set_cursor(uint8_t column, uint8_t row)
 {
-  if (LCD == 0) return;
-  CLCD_WriteI2C(LCD, (uint8_t)character, CLCD_DATA);
+  static const uint8_t row_offset[] = {0x00U, 0x40U, 0x14U, 0x54U};
+
+  if (column >= lcd.columns)
+  {
+    column = (uint8_t)(lcd.columns - 1U);
+  }
+
+  if (row >= lcd.rows)
+  {
+    row = (uint8_t)(lcd.rows - 1U);
+  }
+
+  lcd_command((uint8_t)(LCD_CMD_SET_DDRAM | (row_offset[row] + column)));
 }
 
-#endif /* CLCD_I2C_MINIMAL_IMPL */
-
-/* Timeout for I2C device ready check */
-#define LCD_I2C_PROBE_TRIALS          5U
-#define LCD_I2C_PROBE_TIMEOUT_MS     20U
-
-static uint8_t ucLcdIsReady;
-static CLCD_I2C_Name lcd_device;
-
-static void lcd_display_write_line(uint8_t row, const char *text)
+static void lcd_write_line(uint8_t row, const char *text)
 {
+  char line[LCD_COLUMN_COUNT + 1U];
   uint8_t column;
-  char output_text[LCD_COLUMN_COUNT + 1U];
 
-  memset(output_text, ' ', LCD_COLUMN_COUNT);
-  output_text[LCD_COLUMN_COUNT] = '\0';
+  memset(line, ' ', LCD_COLUMN_COUNT);
+  line[LCD_COLUMN_COUNT] = '\0';
 
-  if (text != 0)
+  if (text != NULL)
   {
-    for (column = 0U; (column < LCD_COLUMN_COUNT) && (text[column] != '\0'); ++column)
+    for (column = 0U; (column < LCD_COLUMN_COUNT) && (text[column] != '\0'); column++)
     {
-      output_text[column] = text[column];
+      line[column] = text[column];
     }
   }
 
-  CLCD_I2C_SetCursor(&lcd_device, 0, row);
+  lcd_set_cursor(0U, row);
 
-  for (column = 0U; column < LCD_COLUMN_COUNT; ++column)
+  for (column = 0U; column < LCD_COLUMN_COUNT; column++)
   {
-    CLCD_I2C_WriteChar(&lcd_device, output_text[column]);
+    lcd_data(line[column]);
+  }
+}
+
+static void lcd_copy_slot(char slot[9], const char *text)
+{
+  uint8_t i;
+
+  memset(slot, ' ', 8U);
+  slot[8] = '\0';
+
+  if (text == NULL)
+  {
+    return;
+  }
+
+  for (i = 0U; (i < 8U) && (text[i] != '\0'); i++)
+  {
+    slot[i] = text[i];
+  }
+}
+
+/* HÀM FORMAT LCD MỚI CHUẨN XÁC DÙNG MEMCPY KHÔNG BAO GIỜ BỊ LỖI MẤT CHỮ */
+static void lcd_format_distance_slot(char slot[9],
+                                     char sensor_name,
+                                     const system_state_t *state)
+{
+  unsigned long distance_cm;
+  char value[6];
+
+  memset(slot, ' ', 8U);
+  slot[8] = '\0';
+  slot[0] = 'S';
+  slot[1] = sensor_name;
+  slot[2] = ':';
+
+  if (state == NULL)
+  {
+    memcpy(&slot[3], "---  ", 5U);
+  }
+  else if (state->system_status == SYSTEM_STATUS_OK)
+  {
+    distance_cm = (unsigned long)(state->distance_mm / 10U);
+    if (distance_cm > 999UL) distance_cm = 999UL;
+    
+    // Ép in đúng 3 số và thêm khoảng trắng để đè chữ cũ
+    (void)snprintf(value, sizeof(value), "%03lu  ", distance_cm); 
+    memcpy(&slot[3], value, 5U);
+  }
+  else if (state->system_status == SYSTEM_STATUS_SENSOR_BELOW_MIN)
+  {
+    memcpy(&slot[3], "<20cm", 5U);
+  }
+  else if (state->system_status == SYSTEM_STATUS_SENSOR_TIMEOUT)
+  {
+    memcpy(&slot[3], "NO   ", 5U); // Hiện S2:NO cực kỳ rõ ràng
+  }
+  else
+  {
+    memcpy(&slot[3], "ERR  ", 5U);
+  }
+}
+
+static const char *lcd_state_text(const system_state_t *state)
+{
+  if (state == NULL)
+  {
+    return "---";
+  }
+
+  switch (state->system_status)
+  {
+    case SYSTEM_STATUS_OK:
+      if (state->warning_level == WARNING_LEVEL_DANGER) return "DANGER ";
+      if (state->warning_level == WARNING_LEVEL_WARNING) return "WARN   ";
+      return "SAFE   ";
+
+    case SYSTEM_STATUS_SENSOR_TIMEOUT:
+      return "TIMEOUT";
+
+    case SYSTEM_STATUS_SENSOR_FAULT:
+      return "FAULT  ";
+
+    case SYSTEM_STATUS_SENSOR_BELOW_MIN:
+      return "DANGER ";
+
+    default:
+      return "UNKNOWN";
   }
 }
 
 bool lcd_display_init(void)
 {
-  if (APP_LCD_ENABLED == 0)
-  {
-    ucLcdIsReady = 0U;
-    return false;
-  }
+  lcd.i2c = &hi2c1;
+  lcd.address = LCD_I2C_ADDRESS;
+  lcd.columns = LCD_COLUMN_COUNT;
+  lcd.rows = LCD_ROW_COUNT;
+  lcd.backlight = LCD_BACKLIGHT_BIT;
 
   HAL_Delay(LCD_BOOT_DELAY_MS);
 
-  if (HAL_I2C_IsDeviceReady(&hi2c1,
-                            LCD_I2C_ADDRESS,
-                            LCD_I2C_PROBE_TRIALS,
-                            LCD_I2C_PROBE_TIMEOUT_MS) != HAL_OK)
+  if (HAL_I2C_IsDeviceReady(lcd.i2c, lcd.address, 5U, 20U) != HAL_OK)
   {
-    ucLcdIsReady = 0U;
+    lcd_ready = 0U;
     return false;
   }
 
-  CLCD_I2C_Init(&lcd_device, &hi2c1, LCD_I2C_ADDRESS, LCD_COLUMN_COUNT, LCD_ROW_COUNT);
+  HAL_Delay(50U);
+  lcd_command(0x33U);
+  lcd_command(0x32U);
+  lcd_command(LCD_CMD_FUNCTION_SET);
+  lcd_command(LCD_CMD_DISPLAY_ON);
+  lcd_command(LCD_CMD_ENTRY_MODE);
+  lcd_command(LCD_CMD_CLEAR);
+  HAL_Delay(2U);
+  lcd_command(LCD_CMD_HOME);
+  HAL_Delay(2U);
 
-  ucLcdIsReady = 1U;
+  lcd_ready = 1U;
   lcd_display_show_boot();
   return true;
 }
 
 void lcd_display_show_boot(void)
 {
-  if (ucLcdIsReady == 0U)
+  if (lcd_ready == 0U)
   {
     return;
   }
-
-  lcd_display_write_line(0U, "S1:AAA S2:BBB");
-  lcd_display_write_line(1U, "STATE S1 STATE S2");
 }
 
-/* line0 (8 chars): "Sx: AAA"
- *    col0='S', col1='1'/'2', col2=':', col3=' ', col4-6=AAA, col7=' '
- */
-static void lcd_display_format_sensor_top(char out8[9],
-                                          const char *label2,
-                                          const system_state_t *sensor_state)
-{
-  unsigned long distance_cm_rounded;
-  char value3[4];
-
-  memset(out8, ' ', 8U);
-  out8[8] = '\0';
-
-  out8[0U] = label2[0U];
-  out8[1U] = label2[1U];
-  out8[2U] = ':';
-  out8[3U] = ' ';
-
-  value3[0] = value3[1] = value3[2] = ' ';
-  value3[3] = '\0';
-
-  if (sensor_state == 0)
-  {
-    (void)snprintf(value3, sizeof(value3), "---");
-  }
-  else if (sensor_state->system_status == SYSTEM_STATUS_OK)
-  {
-    distance_cm_rounded = (unsigned long)(sensor_state->distance_cm + 0.5f);
-    /* lấy 3 chữ số cuối để hiển thị vừa 3 ký tự */
-    distance_cm_rounded %= 1000UL;
-    (void)snprintf(value3, sizeof(value3), "%03lu", distance_cm_rounded);
-  }
-  else if (sensor_state->system_status == SYSTEM_STATUS_SENSOR_BELOW_MIN)
-  {
-    /* hiển thị "<20" nhưng format 3 ký tự -> "20" hoặc "<2?"
-     * ưu tiên hiển thị "<20" => chuyển sang "20 " */
-    (void)snprintf(value3, sizeof(value3), "20 ");
-    value3[0] = '<';
-    value3[1] = '2';
-    value3[2] = '0';
-  }
-  else if (sensor_state->system_status == SYSTEM_STATUS_SENSOR_TIMEOUT)
-  {
-    (void)snprintf(value3, sizeof(value3), "NO ");
-  }
-  else
-  {
-    /* fault/unknown */
-    (void)snprintf(value3, sizeof(value3), "ERR");
-  }
-
-  out8[4U] = value3[0];
-  out8[5U] = value3[1];
-  out8[6U] = value3[2];
-  /* out8[7] là ' ' */
-}
-
-/* line1 (8 chars): hiển thị status/warning level
- *    Format: "TIMEOUT " hoặc "SAFE    " hoặc "WARNING " hoặc "DANGER  "
- *    Chỉ hiển thị trạng thái, không có S1/S2
- */
-static void lcd_display_format_sensor_bottom(char out8[9], const char *label2,
-                                             const system_state_t *sensor_state)
-{
-  const char *status_text;
-  uint8_t idx;
-  
-  memset(out8, ' ', 8U);
-  out8[8] = '\0';
-
-  if (sensor_state == 0)
-  {
-    /* Nếu không có state, hiển thị "---     " */
-    out8[0U] = '-';
-    out8[1U] = '-';
-    out8[2U] = '-';
-    return;
-  }
-
-  /* Ưu tiên hiển thị system_status nếu có lỗi, nếu không hiển thị warning_level */
-  if (sensor_state->system_status != SYSTEM_STATUS_OK)
-  {
-    status_text = system_state_get_status_text(sensor_state->system_status);
-  }
-  else
-  {
-    status_text = system_state_get_warning_text(sensor_state->warning_level);
-  }
-
-  /* Hiển thị status text đầy đủ (8 ký tự), phần còn lại sẽ là spaces */
-  for (idx = 0U; (idx < 8U) && (status_text[idx] != '\0'); ++idx)
-  {
-    out8[idx] = status_text[idx];
-  }
-}
-
-void lcd_display_show_state(const system_state_t *sensor1_state, const system_state_t *sensor2_state)
+void lcd_display_show_state(const system_state_t *sensor1_state,
+                            const system_state_t *sensor2_state)
 {
   char line0[LCD_COLUMN_COUNT + 1U];
   char line1[LCD_COLUMN_COUNT + 1U];
-  char left_top[9];
-  char right_top[9];
-  char left_bottom[9];
-  char right_bottom[9];
+  char left[9];
+  char right[9];
 
-  if (ucLcdIsReady == 0U)
+  if (lcd_ready == 0U)
   {
     return;
   }
 
-  memset(line0, ' ', LCD_COLUMN_COUNT);
-  memset(line1, ' ', LCD_COLUMN_COUNT);
+  lcd_format_distance_slot(left, '1', sensor1_state);
+  lcd_format_distance_slot(right, '2', sensor2_state);
+  memcpy(&line0[0], left, 8U);
+  memcpy(&line0[8], right, 8U);
   line0[LCD_COLUMN_COUNT] = '\0';
+
+  lcd_copy_slot(left, lcd_state_text(sensor1_state));
+  lcd_copy_slot(right, lcd_state_text(sensor2_state));
+  memcpy(&line1[0], left, 8U);
+  memcpy(&line1[8], right, 8U);
   line1[LCD_COLUMN_COUNT] = '\0';
 
-  lcd_display_format_sensor_top(left_top, "S1", sensor1_state);
-  lcd_display_format_sensor_top(right_top, "S2", sensor2_state);
-  lcd_display_format_sensor_bottom(left_bottom, "S1", sensor1_state);
-  lcd_display_format_sensor_bottom(right_bottom, "S2", sensor2_state);
-
-  memcpy(&line0[0], left_top, 8U);
-  memcpy(&line0[8], right_top, 8U);
-  memcpy(&line1[0], left_bottom, 8U);
-  memcpy(&line1[8], right_bottom, 8U);
-
-  lcd_display_write_line(0U, line0);
-  lcd_display_write_line(1U, line1);
+  lcd_write_line(0U, line0);
+  lcd_write_line(1U, line1);
 }

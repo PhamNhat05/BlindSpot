@@ -1,18 +1,27 @@
-# Blind Spot Warning System
+# Hệ Thống Cảnh Báo Điểm Mù
 
-Project structure now follows the required integrated layout:
+## Linh Kiện
 
-Blindcar/
-├── STM32_Firmware/
-├── ESP32_Firmware/
-└── README.md
+| Linh kiện                 | Số lượng |
+|---------------------------|----------|
+| STM32F103C8T6 (Blue Pill) |     1    |
+| Cảm biến siêu âm AJ-SR04M |     2    |
+| LED                       |     3    |
+| Buzzer                    |     1    |
+| Nút nhấn                  |     1    |
+| LCD 16x2 I2C              |     1    |
 
-## System Goal
+## Nguyên Lý Hoạt Động
 
-- JSN-SR04T measures distance
-- STM32 handles real-time processing
-- LED and buzzer warn immediately
-- LCD displays current state
+MCU phát xung **TRIG 10µs** → cảm biến bắn sóng siêu âm → đo thời gian chân **ECHO** phản hồi → tính khoảng cách.
 
+- **< 50 cm:** LED sáng + còi kêu (DANGER)
+- **50–100 cm:** LED nhấp nháy (WARNING)
+- **> 100 cm:** Tắt hết (SAFE)
 
+Nút nhấn dùng để **tắt/bật còi** (mute). Kết quả hiển thị lên LCD qua I2C. 
+Toàn bộ chạy đa nhiệm với **FreeRTOS** (3 task: đọc cảm biến, xử lý cảnh báo, hiển thị LCD).
 
+## Phần Mềm
+
+- **Keil MDK (µVision)** — IDE biên dịch và nạp firmware cho STM32
