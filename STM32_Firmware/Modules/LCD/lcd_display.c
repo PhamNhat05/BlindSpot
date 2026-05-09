@@ -131,7 +131,7 @@ static void lcd_copy_slot(char slot[9], const char *text)
   }
 }
 
-/* HÀM FORMAT LCD MỚI CHUẨN XÁC DÙNG MEMCPY KHÔNG BAO GIỜ BỊ LỖI MẤT CHỮ */
+/* HÀM FORMAT LCD DÙNG MEMCPY */
 static void lcd_format_distance_slot(char slot[9],
                                      char sensor_name,
                                      const system_state_t *state)
@@ -154,7 +154,7 @@ static void lcd_format_distance_slot(char slot[9],
     distance_cm = (unsigned long)(state->distance_mm / 10U);
     if (distance_cm > 999UL) distance_cm = 999UL;
     
-    // Ép in đúng 3 số và thêm khoảng trắng để đè chữ cũ
+    // Ép in đúng 3 số 
     (void)snprintf(value, sizeof(value), "%03lu  ", distance_cm); 
     memcpy(&slot[3], value, 5U);
   }
@@ -164,7 +164,7 @@ static void lcd_format_distance_slot(char slot[9],
   }
   else if (state->system_status == SYSTEM_STATUS_SENSOR_TIMEOUT)
   {
-    memcpy(&slot[3], "NO   ", 5U); // Hiện S2:NO cực kỳ rõ ràng
+    memcpy(&slot[3], "NO   ", 5U); 
   }
   else
   {
