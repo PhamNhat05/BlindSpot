@@ -1,0 +1,7 @@
+#ifndef THRESHOLDS_H
+#define THRESHOLDS_H
+
+#define SAFE_DISTANCE_THRESHOLD_CM       100.0f
+#define WARNING_DISTANCE_THRESHOLD_CM     50.0f
+
+#endif /* THRESHOLDS_H */
